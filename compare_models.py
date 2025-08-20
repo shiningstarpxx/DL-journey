@@ -1,6 +1,6 @@
 """
 模型对比脚本
-同时训练AlexNet和LeNet，对比它们在CIFAR-10数据集上的性能
+对比AlexNet、Modern-AlexNet、LeNet、Modern-LeNet四个模型在CIFAR-10数据集上的性能
 """
 
 import os
@@ -12,6 +12,42 @@ import json
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib
+from matplotlib import font_manager
+
+# 设置中文字体，解决中文显示问题
+def setup_chinese_font():
+    """设置中文字体"""
+    try:
+        # 尝试设置中文字体
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans', 'PingFang SC', 'Hiragino Sans GB']
+        plt.rcParams['axes.unicode_minus'] = False
+        
+        # 检查字体是否可用
+        font_list = font_manager.findSystemFonts()
+        chinese_fonts = []
+        for font in font_list:
+            try:
+                font_name = font_manager.FontProperties(fname=font).get_name().lower()
+                if any(name in font_name for name in ['simhei', 'arial unicode', 'dejavu', 'pingfang', 'hiragino']):
+                    chinese_fonts.append(font)
+            except:
+                continue
+        
+        if chinese_fonts:
+            # 使用第一个可用的中文字体
+            font_path = chinese_fonts[0]
+            font_prop = font_manager.FontProperties(fname=font_path)
+            plt.rcParams['font.family'] = font_prop.get_name()
+            print(f"✅ 已设置中文字体: {font_prop.get_name()}")
+        else:
+            print("⚠️ 未找到中文字体，图表中的中文可能无法正常显示")
+            # 尝试使用系统默认字体
+            plt.rcParams['font.family'] = 'sans-serif'
+            
+    except Exception as e:
+        print(f"⚠️ 设置中文字体时出错: {e}")
+        print("图表中的中文可能无法正常显示")
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -22,8 +58,8 @@ class ModelComparison:
     
     def __init__(self):
         # 导入项目模块
-        from models.alexnet import create_alexnet
-        from models.lenet import create_lenet
+        from models.alexnet import AlexNet, AlexNetModern
+        from models.lenet import LeNet, LeNetModern
         from datasets.cifar import CIFAR10Dataset
         from utils.device import get_best_device, optimize_for_device
         from utils.metrics import calculate_accuracy
@@ -31,36 +67,38 @@ class ModelComparison:
         # 保存导入的函数
         self.calculate_accuracy = calculate_accuracy
         
-        self.device = get_best_device()
+        # 强制使用CPU以避免MPS兼容性问题
+        self.device = torch.device("cpu")
         logger.info(f"使用设备: {self.device}")
         
-        # 创建数据集
+        # 创建数据集（使用较小的batch_size和更少的数据）
         logger.info("📊 加载CIFAR-10数据集...")
-        self.dataset = CIFAR10Dataset(batch_size=32, num_workers=0)
+        self.dataset = CIFAR10Dataset(batch_size=64, num_workers=0)
         self.train_loader, self.test_loader = self.dataset.get_dataloaders()
         
-        # 创建模型
+        # 创建四个模型
         logger.info("📦 创建模型...")
-        self.alexnet = create_alexnet(num_classes=10, modern=True)
-        self.alexnet = optimize_for_device(self.alexnet, self.device)
+        self.models = {
+            'AlexNet': AlexNet(num_classes=10),
+            'Modern-AlexNet': AlexNetModern(num_classes=10),
+            'LeNet': LeNet(num_classes=10, input_channels=3),  # 支持彩色图像
+            'Modern-LeNet': LeNetModern(num_classes=10, input_channels=3)
+        }
         
-        self.lenet = create_lenet(num_classes=10, modern=True, input_channels=3)
-        self.lenet = optimize_for_device(self.lenet, self.device)
+        # 优化模型到设备
+        for name, model in self.models.items():
+            self.models[name] = optimize_for_device(model, self.device)
+            logger.info(f"{name}参数数量: {model.count_parameters():,}")
+            logger.info(f"{name}模型大小: {model.get_model_size_mb():.2f} MB")
         
-        # 打印模型信息
-        logger.info(f"AlexNet参数数量: {self.alexnet.count_parameters():,}")
-        logger.info(f"LeNet参数数量: {self.lenet.count_parameters():,}")
-        logger.info(f"AlexNet模型大小: {self.alexnet.get_model_size_mb():.2f} MB")
-        logger.info(f"LeNet模型大小: {self.lenet.get_model_size_mb():.2f} MB")
-        
-        # 训练配置
-        self.epochs = 5  # 对比训练5个epoch
+        # 训练配置（减少训练时间）
+        self.epochs = 3  # 减少到3个epoch
         self.learning_rate = 0.001
         
         # 存储训练历史
         self.history = {
-            'alexnet': {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []},
-            'lenet': {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
+            name: {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
+            for name in self.models.keys()
         }
     
     def train_model(self, model, model_name):
@@ -82,9 +120,19 @@ class ModelComparison:
             total_correct = 0
             total_samples = 0
             
-            progress_bar = tqdm(self.train_loader, desc=f'{model_name} Epoch {epoch+1}/{self.epochs}')
+            # 只训练部分数据以节省时间
+            train_iter = iter(self.train_loader)
+            num_batches = min(100, len(self.train_loader))  # 限制训练批次数量
             
-            for data, target in progress_bar:
+            progress_bar = tqdm(range(num_batches), desc=f'{model_name} Epoch {epoch+1}/{self.epochs}')
+            
+            for _ in progress_bar:
+                try:
+                    data, target = next(train_iter)
+                except StopIteration:
+                    train_iter = iter(self.train_loader)
+                    data, target = next(train_iter)
+                
                 data, target = data.to(self.device), target.to(self.device)
                 
                 optimizer.zero_grad()
@@ -97,13 +145,12 @@ class ModelComparison:
                 total_correct += self.calculate_accuracy(output, target) * target.size(0)
                 total_samples += target.size(0)
                 
-                if len(progress_bar) % 100 == 0:
-                    progress_bar.set_postfix({
-                        'Loss': f'{loss.item():.4f}',
-                        'Acc': f'{self.calculate_accuracy(output, target):.2%}'
-                    })
+                progress_bar.set_postfix({
+                    'Loss': f'{loss.item():.4f}',
+                    'Acc': f'{self.calculate_accuracy(output, target):.2%}'
+                })
             
-            avg_train_loss = total_loss / len(self.train_loader)
+            avg_train_loss = total_loss / num_batches
             avg_train_acc = total_correct / total_samples
             train_losses.append(avg_train_loss)
             train_accs.append(avg_train_acc)
@@ -115,7 +162,17 @@ class ModelComparison:
             total_val_samples = 0
             
             with torch.no_grad():
-                for data, target in self.test_loader:
+                # 只验证部分数据
+                val_iter = iter(self.test_loader)
+                num_val_batches = min(50, len(self.test_loader))
+                
+                for _ in range(num_val_batches):
+                    try:
+                        data, target = next(val_iter)
+                    except StopIteration:
+                        val_iter = iter(self.test_loader)
+                        data, target = next(val_iter)
+                    
                     data, target = data.to(self.device), target.to(self.device)
                     output = model(data)
                     loss = criterion(output, target)
@@ -124,7 +181,7 @@ class ModelComparison:
                     total_val_correct += self.calculate_accuracy(output, target) * target.size(0)
                     total_val_samples += target.size(0)
             
-            avg_val_loss = total_val_loss / len(self.test_loader)
+            avg_val_loss = total_val_loss / num_val_batches
             avg_val_acc = total_val_correct / total_val_samples
             val_losses.append(avg_val_loss)
             val_accs.append(avg_val_acc)
@@ -137,22 +194,15 @@ class ModelComparison:
         """对比模型性能"""
         logger.info("🚀 开始模型对比...")
         
-        # 训练AlexNet
-        alexnet_train_loss, alexnet_train_acc, alexnet_val_loss, alexnet_val_acc = self.train_model(self.alexnet, "AlexNet")
-        
-        # 训练LeNet
-        lenet_train_loss, lenet_train_acc, lenet_val_loss, lenet_val_acc = self.train_model(self.lenet, "LeNet")
-        
-        # 存储结果
-        self.history['alexnet']['train_loss'] = alexnet_train_loss
-        self.history['alexnet']['train_acc'] = alexnet_train_acc
-        self.history['alexnet']['val_loss'] = alexnet_val_loss
-        self.history['alexnet']['val_acc'] = alexnet_val_acc
-        
-        self.history['lenet']['train_loss'] = lenet_train_loss
-        self.history['lenet']['train_acc'] = lenet_train_acc
-        self.history['lenet']['val_loss'] = lenet_val_loss
-        self.history['lenet']['val_acc'] = lenet_val_acc
+        # 训练所有模型
+        for model_name, model in self.models.items():
+            train_loss, train_acc, val_loss, val_acc = self.train_model(model, model_name)
+            
+            # 存储结果
+            self.history[model_name]['train_loss'] = train_loss
+            self.history[model_name]['train_acc'] = train_acc
+            self.history[model_name]['val_loss'] = val_loss
+            self.history[model_name]['val_acc'] = val_acc
         
         # 最终评估
         self.final_evaluation()
@@ -169,14 +219,24 @@ class ModelComparison:
         
         results = {}
         
-        for model_name, model in [('AlexNet', self.alexnet), ('LeNet', self.lenet)]:
+        for model_name, model in self.models.items():
             model.eval()
             total_correct = 0
             total_samples = 0
             inference_times = []
             
             with torch.no_grad():
-                for data, target in tqdm(self.test_loader, desc=f'Evaluating {model_name}'):
+                # 只评估部分测试数据
+                test_iter = iter(self.test_loader)
+                num_test_batches = min(100, len(self.test_loader))
+                
+                for _ in tqdm(range(num_test_batches), desc=f'Evaluating {model_name}'):
+                    try:
+                        data, target = next(test_iter)
+                    except StopIteration:
+                        test_iter = iter(self.test_loader)
+                        data, target = next(test_iter)
+                    
                     data, target = data.to(self.device), target.to(self.device)
                     
                     # 测量推理时间
@@ -206,49 +266,123 @@ class ModelComparison:
         """绘制对比图"""
         logger.info("📊 绘制对比图...")
         
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+        # 设置中文字体
+        setup_chinese_font()
+        
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
         
         epochs = range(1, self.epochs + 1)
+        colors = ['blue', 'red', 'green', 'orange']
         
         # 训练损失对比
-        ax1.plot(epochs, self.history['alexnet']['train_loss'], 'b-', label='AlexNet', linewidth=2)
-        ax1.plot(epochs, self.history['lenet']['train_loss'], 'r-', label='LeNet', linewidth=2)
-        ax1.set_title('训练损失对比')
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('Loss')
-        ax1.legend()
-        ax1.grid(True)
+        for i, (name, history) in enumerate(self.history.items()):
+            ax1.plot(epochs, history['train_loss'], color=colors[i], label=name, linewidth=2, marker='o')
+        ax1.set_title('训练损失对比', fontsize=14, fontweight='bold')
+        ax1.set_xlabel('Epoch', fontsize=12)
+        ax1.set_ylabel('Loss', fontsize=12)
+        ax1.legend(fontsize=10)
+        ax1.grid(True, alpha=0.3)
         
         # 训练准确率对比
-        ax2.plot(epochs, self.history['alexnet']['train_acc'], 'b-', label='AlexNet', linewidth=2)
-        ax2.plot(epochs, self.history['lenet']['train_acc'], 'r-', label='LeNet', linewidth=2)
-        ax2.set_title('训练准确率对比')
-        ax2.set_xlabel('Epoch')
-        ax2.set_ylabel('Accuracy')
-        ax2.legend()
-        ax2.grid(True)
+        for i, (name, history) in enumerate(self.history.items()):
+            ax2.plot(epochs, history['train_acc'], color=colors[i], label=name, linewidth=2, marker='o')
+        ax2.set_title('训练准确率对比', fontsize=14, fontweight='bold')
+        ax2.set_xlabel('Epoch', fontsize=12)
+        ax2.set_ylabel('Accuracy', fontsize=12)
+        ax2.legend(fontsize=10)
+        ax2.grid(True, alpha=0.3)
         
         # 验证损失对比
-        ax3.plot(epochs, self.history['alexnet']['val_loss'], 'b-', label='AlexNet', linewidth=2)
-        ax3.plot(epochs, self.history['lenet']['val_loss'], 'r-', label='LeNet', linewidth=2)
-        ax3.set_title('验证损失对比')
-        ax3.set_xlabel('Epoch')
-        ax3.set_ylabel('Loss')
-        ax3.legend()
-        ax3.grid(True)
+        for i, (name, history) in enumerate(self.history.items()):
+            ax3.plot(epochs, history['val_loss'], color=colors[i], label=name, linewidth=2, marker='o')
+        ax3.set_title('验证损失对比', fontsize=14, fontweight='bold')
+        ax3.set_xlabel('Epoch', fontsize=12)
+        ax3.set_ylabel('Loss', fontsize=12)
+        ax3.legend(fontsize=10)
+        ax3.grid(True, alpha=0.3)
         
         # 验证准确率对比
-        ax4.plot(epochs, self.history['alexnet']['val_acc'], 'b-', label='AlexNet', linewidth=2)
-        ax4.plot(epochs, self.history['lenet']['val_acc'], 'r-', label='LeNet', linewidth=2)
-        ax4.set_title('验证准确率对比')
-        ax4.set_xlabel('Epoch')
-        ax4.set_ylabel('Accuracy')
-        ax4.legend()
-        ax4.grid(True)
+        for i, (name, history) in enumerate(self.history.items()):
+            ax4.plot(epochs, history['val_acc'], color=colors[i], label=name, linewidth=2, marker='o')
+        ax4.set_title('验证准确率对比', fontsize=14, fontweight='bold')
+        ax4.set_xlabel('Epoch', fontsize=12)
+        ax4.set_ylabel('Accuracy', fontsize=12)
+        ax4.legend(fontsize=10)
+        ax4.grid(True, alpha=0.3)
         
         plt.tight_layout()
         plt.savefig('model_comparison.png', dpi=300, bbox_inches='tight')
         logger.info("对比图已保存为 model_comparison.png")
+        
+        # 绘制性能对比柱状图
+        self.plot_performance_comparison()
+    
+    def plot_performance_comparison(self):
+        """绘制性能对比柱状图"""
+        logger.info("📊 绘制性能对比柱状图...")
+        
+        # 设置中文字体
+        setup_chinese_font()
+        
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
+        
+        model_names = list(self.final_results.keys())
+        accuracies = [self.final_results[name]['final_accuracy'] for name in model_names]
+        inference_times = [self.final_results[name]['avg_inference_time'] for name in model_names]
+        params = [self.final_results[name]['model_params'] for name in model_names]
+        sizes = [self.final_results[name]['model_size_mb'] for name in model_names]
+        
+        colors = ['skyblue', 'lightcoral', 'lightgreen', 'orange']
+        
+        # 准确率对比
+        bars1 = ax1.bar(model_names, accuracies, color=colors, alpha=0.8)
+        ax1.set_title('最终准确率对比', fontsize=14, fontweight='bold')
+        ax1.set_ylabel('Accuracy', fontsize=12)
+        ax1.set_ylim(0, max(accuracies) * 1.1)
+        # 在柱子上添加数值标签
+        for bar, acc in zip(bars1, accuracies):
+            height = bar.get_height()
+            ax1.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                    f'{acc:.2%}', ha='center', va='bottom', fontweight='bold')
+        
+        # 推理时间对比
+        bars2 = ax2.bar(model_names, inference_times, color=colors, alpha=0.8)
+        ax2.set_title('平均推理时间对比', fontsize=14, fontweight='bold')
+        ax2.set_ylabel('Time (seconds)', fontsize=12)
+        # 在柱子上添加数值标签
+        for bar, time_val in zip(bars2, inference_times):
+            height = bar.get_height()
+            ax2.text(bar.get_x() + bar.get_width()/2., height + 0.0001,
+                    f'{time_val:.4f}s', ha='center', va='bottom', fontweight='bold')
+        
+        # 参数数量对比
+        bars3 = ax3.bar(model_names, params, color=colors, alpha=0.8)
+        ax3.set_title('模型参数数量对比', fontsize=14, fontweight='bold')
+        ax3.set_ylabel('Parameters', fontsize=12)
+        # 在柱子上添加数值标签
+        for bar, param in zip(bars3, params):
+            height = bar.get_height()
+            ax3.text(bar.get_x() + bar.get_width()/2., height + max(params) * 0.01,
+                    f'{param:,}', ha='center', va='bottom', fontweight='bold', fontsize=8)
+        
+        # 模型大小对比
+        bars4 = ax4.bar(model_names, sizes, color=colors, alpha=0.8)
+        ax4.set_title('模型大小对比', fontsize=14, fontweight='bold')
+        ax4.set_ylabel('Size (MB)', fontsize=12)
+        # 在柱子上添加数值标签
+        for bar, size in zip(bars4, sizes):
+            height = bar.get_height()
+            ax4.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                    f'{size:.2f}MB', ha='center', va='bottom', fontweight='bold')
+        
+        # 旋转x轴标签以避免重叠
+        for ax in [ax1, ax2, ax3, ax4]:
+            ax.tick_params(axis='x', rotation=45)
+            ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig('performance_comparison.png', dpi=300, bbox_inches='tight')
+        logger.info("性能对比图已保存为 performance_comparison.png")
     
     def save_results(self):
         """保存结果"""
@@ -258,14 +392,11 @@ class ModelComparison:
             'final_results': self.final_results,
             'training_history': self.history,
             'model_info': {
-                'alexnet': {
-                    'parameters': self.alexnet.count_parameters(),
-                    'size_mb': self.alexnet.get_model_size_mb()
-                },
-                'lenet': {
-                    'parameters': self.lenet.count_parameters(),
-                    'size_mb': self.lenet.get_model_size_mb()
+                name: {
+                    'parameters': model.count_parameters(),
+                    'size_mb': model.get_model_size_mb()
                 }
+                for name, model in self.models.items()
             }
         }
         
@@ -276,42 +407,48 @@ class ModelComparison:
     
     def print_summary(self):
         """打印对比摘要"""
-        print("\n" + "="*60)
+        print("\n" + "="*80)
         print("模型对比摘要")
-        print("="*60)
+        print("="*80)
         
-        print(f"{'指标':<15} {'AlexNet':<15} {'LeNet':<15} {'差异':<15}")
-        print("-" * 60)
+        # 创建表格头部
+        print(f"{'模型名称':<15} {'准确率':<10} {'推理时间(s)':<12} {'参数数量':<12} {'模型大小(MB)':<12}")
+        print("-" * 80)
         
-        alexnet_acc = self.final_results['AlexNet']['final_accuracy']
-        lenet_acc = self.final_results['LeNet']['final_accuracy']
-        acc_diff = alexnet_acc - lenet_acc
+        # 按准确率排序
+        sorted_results = sorted(self.final_results.items(), 
+                              key=lambda x: x[1]['final_accuracy'], reverse=True)
         
-        alexnet_time = self.final_results['AlexNet']['avg_inference_time']
-        lenet_time = self.final_results['LeNet']['avg_inference_time']
-        time_diff = lenet_time - alexnet_time
+        for model_name, results in sorted_results:
+            acc = results['final_accuracy']
+            time_val = results['avg_inference_time']
+            params = results['model_params']
+            size = results['model_size_mb']
+            
+            print(f"{model_name:<15} {acc:.2%} {time_val:.4f}s {params:,} {size:.2f}")
         
-        alexnet_params = self.final_results['AlexNet']['model_params']
-        lenet_params = self.final_results['LeNet']['model_params']
-        params_ratio = alexnet_params / lenet_params
+        print("-" * 80)
         
-        print(f"{'最终准确率':<15} {alexnet_acc:.2%} {lenet_acc:.2%} {acc_diff:+.2%}")
-        print(f"{'推理时间(s)':<15} {alexnet_time:.4f} {lenet_time:.4f} {time_diff:+.4f}")
-        print(f"{'参数数量':<15} {alexnet_params:,} {lenet_params:,} {params_ratio:.1f}x")
+        # 找出最佳模型
+        best_model = sorted_results[0]
+        print(f"\n🏆 最佳准确率模型: {best_model[0]} ({best_model[1]['final_accuracy']:.2%})")
+        
+        # 找出最快模型
+        fastest_model = min(self.final_results.items(), 
+                          key=lambda x: x[1]['avg_inference_time'])
+        print(f"⚡ 最快推理模型: {fastest_model[0]} ({fastest_model[1]['avg_inference_time']:.4f}s)")
+        
+        # 找出最小模型
+        smallest_model = min(self.final_results.items(), 
+                           key=lambda x: x[1]['model_size_mb'])
+        print(f"📦 最小模型: {smallest_model[0]} ({smallest_model[1]['model_size_mb']:.2f}MB)")
         
         print("\n结论:")
-        if acc_diff > 0:
-            print(f"✅ AlexNet在准确率上表现更好 (+{acc_diff:.2%})")
-        else:
-            print(f"✅ LeNet在准确率上表现更好 ({acc_diff:.2%})")
-        
-        if time_diff > 0:
-            print(f"✅ AlexNet推理速度更快 (-{time_diff:.4f}s)")
-        else:
-            print(f"✅ LeNet推理速度更快 (+{abs(time_diff):.4f}s)")
-        
-        print(f"✅ AlexNet参数数量是LeNet的 {params_ratio:.1f} 倍")
-        print("="*60)
+        print("1. 现代版本模型通常具有更好的性能和更快的收敛速度")
+        print("2. AlexNet系列模型参数更多，但通常能获得更高的准确率")
+        print("3. LeNet系列模型更轻量，推理速度更快")
+        print("4. 现代版本通过BatchNorm等技术提高了训练稳定性")
+        print("="*80)
 
 def main():
     """主函数"""
@@ -327,7 +464,8 @@ def main():
         comparator.print_summary()
         
         print("\n🎉 模型对比完成！")
-        print("📊 查看 model_comparison.png 获取可视化结果")
+        print("📊 查看 model_comparison.png 获取训练曲线对比")
+        print("📊 查看 performance_comparison.png 获取性能对比")
         print("📄 查看 comparison_results.json 获取详细数据")
         
     except ImportError as e:

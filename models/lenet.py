@@ -20,7 +20,7 @@ class LeNet(BaseModel):
     年份: 1998
     """
     
-    def __init__(self, num_classes=10, pretrained=False, dropout_rate=0.5):
+    def __init__(self, num_classes=10, pretrained=False, dropout_rate=0.5, input_channels=1):
         """
         初始化LeNet
         
@@ -28,8 +28,10 @@ class LeNet(BaseModel):
             num_classes (int): 分类数量
             pretrained (bool): 是否使用预训练权重
             dropout_rate (float): Dropout比率
+            input_channels (int): 输入通道数 (1为灰度，3为彩色)
         """
         self.dropout_rate = dropout_rate
+        self.input_channels = input_channels
         super(LeNet, self).__init__(num_classes, pretrained)
     
     def _build_model(self):
@@ -39,7 +41,7 @@ class LeNet(BaseModel):
         # 特征提取层
         self.features = nn.Sequential(
             # 第一个卷积层
-            nn.Conv2d(1, 6, kernel_size=5, stride=1, padding=0),
+            nn.Conv2d(self.input_channels, 6, kernel_size=5, stride=1, padding=0),
             nn.Tanh(),
             nn.AvgPool2d(kernel_size=2, stride=2),
             
@@ -52,6 +54,9 @@ class LeNet(BaseModel):
             nn.Conv2d(16, 120, kernel_size=5, stride=1, padding=0),
             nn.Tanh(),
         )
+        
+        # 自适应池化层，适应不同输入尺寸
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((1, 1))
         
         # 分类器层
         self.classifier = nn.Sequential(
@@ -82,12 +87,13 @@ class LeNet(BaseModel):
         前向传播
         
         Args:
-            x: 输入张量 [batch_size, 1, 28, 28] (原始LeNet用于MNIST)
+            x: 输入张量 [batch_size, channels, height, width]
             
         Returns:
             输出张量 [batch_size, num_classes]
         """
         x = self.features(x)
+        x = self.adaptive_pool(x)
         x = torch.flatten(x, 1)
         x = self.classifier(x)
         return x
@@ -103,6 +109,7 @@ class LeNet(BaseModel):
             特征张量
         """
         x = self.features(x)
+        x = self.adaptive_pool(x)
         x = torch.flatten(x, 1)
         # 返回最后一个全连接层之前的特征
         for i, layer in enumerate(self.classifier):
@@ -240,7 +247,7 @@ def create_lenet(num_classes=10, pretrained=False, modern=True, input_channels=3
     if modern:
         return LeNetModern(num_classes=num_classes, pretrained=pretrained, input_channels=input_channels)
     else:
-        return LeNet(num_classes=num_classes, pretrained=pretrained)
+        return LeNet(num_classes=num_classes, pretrained=pretrained, input_channels=input_channels)
 
 if __name__ == "__main__":
     # 测试模型
@@ -248,12 +255,21 @@ if __name__ == "__main__":
     
     # 测试原始LeNet (灰度图像)
     print("=== 原始LeNet (灰度图像) ===")
-    model = LeNet(num_classes=10)
+    model = LeNet(num_classes=10, input_channels=1)
     x = torch.randn(1, 1, 28, 28)  # MNIST尺寸
     output = model(x)
     print(f"输入形状: {x.shape}")
     print(f"输出形状: {output.shape}")
     model.print_model_info()
+    
+    # 测试原始LeNet (彩色图像)
+    print("\n=== 原始LeNet (彩色图像) ===")
+    model_color = LeNet(num_classes=10, input_channels=3)
+    x_color = torch.randn(1, 3, 32, 32)  # CIFAR-10尺寸
+    output_color = model_color(x_color)
+    print(f"输入形状: {x_color.shape}")
+    print(f"输出形状: {output_color.shape}")
+    model_color.print_model_info()
     
     # 测试现代版LeNet (彩色图像)
     print("\n=== 现代版LeNet (彩色图像) ===")
